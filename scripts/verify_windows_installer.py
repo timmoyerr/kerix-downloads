@@ -89,9 +89,16 @@ def check_app(executable, profile):
     marker = next((line.removeprefix('KERIX_SMOKE_RESULT=') for line in lines
                    if line.startswith('KERIX_SMOKE_RESULT=')), 'null')
     report = json.loads(marker)
-    require(result.returncode == 0 and isinstance(report, dict)
-            and report.get('ok') is True and report.get('licenseLocked') is True,
-            'Installed app activation/preload smoke failed.')
+    ok = result.returncode == 0 and isinstance(report, dict) and report.get('ok') is True and report.get('licenseLocked') is True
+    if not ok:
+        print('App exit status:', result.returncode, flush=True)
+        print('Smoke marker present:', marker != 'null', flush=True)
+        for line in lines[-30:]:
+            if re.search(r'password|authorization|signing_key|secret_key|(?:access|refresh)[_-]?token', line, re.I):
+                print('[sensitive app diagnostic omitted]', flush=True)
+            else:
+                print(line[:600], flush=True)
+    require(ok, 'Installed app activation/preload smoke failed.')
     print('Installed Electron activation gate and preload passed.')
 
 
