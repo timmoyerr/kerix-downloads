@@ -1,5 +1,6 @@
 """Public, credential-free acceptance for the published Kerix Windows preview."""
 import base64
+from contextlib import contextmanager
 import csv
 import hashlib
 import json
@@ -23,6 +24,53 @@ OPENER = build_opener(ProxyHandler({}))
 
 class AcceptanceFailure(RuntimeError):
     """Only fixed, author-written acceptance diagnostics belong in this error."""
+
+
+def current_user_identity(environment):
+    """Read TokenUser through the fixed Windows tool; never print its identity."""
+    system = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32'
+    result = subprocess.run([str(system / 'whoami.exe'), '/user', '/fo', 'csv', '/nh'],
+                            env=environment, capture_output=True, timeout=20, check=True)
+    rows = list(csv.reader(result.stdout.decode('utf-8', errors='strict').splitlines()))
+    require(len(rows) == 1 and len(rows[0]) == 2 and re.fullmatch(r'S-1-\d+(?:-\d+){1,15}', rows[0][1])
+            and len(rows[0][1]) <= 184, 'The fixture current-user SID is unavailable.')
+    return rows[0]
+
+
+def protect_fixture_root(root):
+    """Grant only the actual user and SYSTEM access to a newly owned fixture."""
+    import ctypes
+    from ctypes import wintypes
+    require(root.is_absolute() and root.is_dir() and not root.is_symlink(), 'The owned fixture root is invalid.')
+    environment = {name: value for name, value in os.environ.items() if name in
+                   {'HOME', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'}}
+    _, sid = current_user_identity(environment)
+    security = ctypes.WinDLL('advapi32.dll', use_last_error=True, winmode=0x800)
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    security.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    security.SetFileSecurityW.restype = wintypes.BOOL
+    descriptor = ctypes.c_void_p()
+    sddl = 'D:P(A;OICI;FA;;;' + sid + ')(A;OICI;FA;;;SY)'
+    require(bool(security.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), None)),
+            'The fixture protection descriptor could not be created.')
+    try:
+        require(bool(security.SetFileSecurityW(str(root), 0x80000004, descriptor)), 'The fixture root could not be protected.')
+    finally:
+        kernel = ctypes.WinDLL('kernel32.dll', use_last_error=True, winmode=0x800)
+        kernel.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel.LocalFree.restype = ctypes.c_void_p
+        kernel.LocalFree(descriptor)
+
+
+@contextmanager
+def private_fixture_directory(prefix):
+    """Protect only a directory created and owned by this fixture context."""
+    require(prefix in {'kerix-postgres-only-', 'kerix-installer-acceptance-'}, 'Unknown private fixture kind.')
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        root = Path(directory)
+        protect_fixture_root(root)
+        yield root
 
 
 def runtime_diagnostics(data):
@@ -266,12 +314,7 @@ def run_postgres_probe(name, command, directory, environment):
 def postgres_acl_retry(runtime, directory, environment):
     """Only an extracted, owned PG tree receives the diagnostic user RX ACE."""
     system = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32'
-    identity = subprocess.run([str(system / 'whoami.exe'), '/user', '/fo', 'csv', '/nh'],
-                              env=environment, capture_output=True, timeout=20, check=True)
-    rows = list(csv.reader(identity.stdout.decode('utf-8', errors='replace').splitlines()))
-    require(len(rows) == 1 and len(rows[0]) == 2 and re.fullmatch(r'S-1-\d+(?:-\d+){1,15}', rows[0][1]),
-            'The diagnostic current-user SID is unavailable.')
-    principal, sid = rows[0]
+    principal, sid = current_user_identity(environment)
     postgres = runtime / 'postgres'
     require(postgres.is_dir() and not postgres.is_symlink(), 'The owned diagnostic PostgreSQL tree is unavailable.')
     icacls = str(system / 'icacls.exe')
@@ -401,8 +444,7 @@ def extract_probe(archive, destination):
 
 def probe_only(base, expected_sha):
     require(re.fullmatch(r'[a-f0-9]{64}', expected_sha), 'An exact PostgreSQL probe SHA256 is required.')
-    with tempfile.TemporaryDirectory(prefix='kerix-postgres-only-') as directory:
-        root = Path(directory)
+    with private_fixture_directory('kerix-postgres-only-') as root:
         archive = root / 'probe.zip'
         fetch(base + 'kerix-postgresql-16.13-win32-x64-probe.zip', archive, 64 * 1024 * 1024)
         require(hashlib.sha256(archive.read_bytes()).hexdigest() == expected_sha, 'PostgreSQL probe checksum differs.')
@@ -489,8 +531,7 @@ def main():
     if pg_only == '1':
         probe_only(base, os.environ.get('KERIX_PG_PROBE_SHA256', ''))
         return
-    with tempfile.TemporaryDirectory(prefix='kerix-installer-acceptance-') as directory:
-        root = Path(directory)
+    with private_fixture_directory('kerix-installer-acceptance-') as root:
         checksum_path, installer = root / 'SHA256SUMS', root / name
         fetch(base + 'SHA256SUMS', checksum_path, 1024 * 1024)
         checksums = {}

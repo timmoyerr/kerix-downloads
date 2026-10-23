@@ -202,6 +202,42 @@ class InstallerPhaseTests(unittest.TestCase):
         self.assertIn('Narrow PG ACL diagnostic unavailable: OSError', output.getvalue())
         self.assertNotIn('synthetic private message', output.getvalue())
 
+    def test_fixture_root_gets_exact_user_system_protected_dacl_only(self):
+        import ctypes
+        sid = 'S-1-5-21-123-456-789-1001'
+        security, kernel = MagicMock(), MagicMock()
+        with (patch.object(acceptance, 'current_user_identity', return_value=['synthetic-user', sid]) as identity,
+              patch.object(ctypes, 'WinDLL', side_effect=[security, kernel], create=True) as load,
+              patch.dict(os.environ, {'PGPASSWORD': 'synthetic-private-password'})):
+            acceptance.protect_fixture_root(self.root)
+        sddl = security.ConvertStringSecurityDescriptorToSecurityDescriptorW.call_args.args[0]
+        self.assertEqual(sddl, 'D:P(A;OICI;FA;;;' + sid + ')(A;OICI;FA;;;SY)')
+        self.assertEqual(security.SetFileSecurityW.call_args.args[:2], (str(self.root), 0x80000004))
+        self.assertNotIn('PGPASSWORD', identity.call_args.args[0])
+        self.assertTrue(all(call.kwargs['winmode'] == 0x800 for call in load.call_args_list))
+        kernel.LocalFree.assert_called_once()
+
+    def test_fixture_context_only_protects_its_new_root_before_use(self):
+        context = MagicMock()
+        context.__enter__.return_value = str(self.root)
+        with (patch.object(acceptance.tempfile, 'TemporaryDirectory', return_value=context) as temporary,
+              patch.object(acceptance, 'protect_fixture_root') as protect):
+            with acceptance.private_fixture_directory('kerix-postgres-only-') as root:
+                self.assertEqual(root, self.root)
+                protect.assert_called_once_with(self.root)
+        temporary.assert_called_once_with(prefix='kerix-postgres-only-')
+        context.__exit__.assert_called_once()
+        with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'Unknown private fixture kind'):
+            with acceptance.private_fixture_directory('arbitrary-existing-path'):
+                self.fail('Unknown fixture kind accepted')
+
+    def test_fixture_identity_refuses_malformed_or_multiple_sid_rows(self):
+        for output in (b'"synthetic","S-1-5-21-12;untrusted"\n', b'"synthetic","S-0-5-123"\n',
+                       b'"synthetic","S-1-5-21-1"\n"other","S-1-5-21-2"\n', b'"synthetic"\n'):
+            with self.subTest(output=output), patch.object(acceptance.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, output, b'')):
+                with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'current-user SID is unavailable'):
+                    acceptance.current_user_identity({})
+
 
 if __name__ == '__main__':
     unittest.main()
