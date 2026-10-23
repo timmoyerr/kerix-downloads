@@ -16,6 +16,10 @@ from urllib.parse import quote, quote_plus
 OPENER = build_opener(ProxyHandler({}))
 
 
+class AcceptanceFailure(RuntimeError):
+    """Only fixed, author-written acceptance diagnostics belong in this error."""
+
+
 def runtime_diagnostics(data):
     """Read only this generated fixture's logs; never expose its credentials."""
     secrets = []
@@ -69,7 +73,7 @@ def runtime_diagnostics(data):
 
 def require(condition, message):
     if not condition:
-        raise RuntimeError(message)
+        raise AcceptanceFailure(message)
 
 
 def fetch(url, destination, limit):
@@ -139,7 +143,7 @@ def check_runtime(runtime, state):
                     finally:
                         error.close()
                 else:
-                    raise RuntimeError('Backend exposed the workspace without a license.')
+                    raise AcceptanceFailure('Backend exposed the workspace without a license.')
                 token = session['accessToken'].split('.')[1]
                 current_owner = json.loads(base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)))['sub']
                 current_secrets = hashlib.sha256((state / 'secrets.json').read_bytes()).hexdigest()
@@ -186,10 +190,56 @@ def runtime_command(runtime):
     return [str(executable)]
 
 
+def uninstall_app(install):
+    executable = install / 'Kerix.exe'
+    uninstall = install / 'Uninstall Kerix.exe'
+    require(uninstall.is_file(), 'NSIS uninstaller is missing.')
+    subprocess.run([str(uninstall), '/S'], timeout=120, check=True)
+    # NSIS may spawn a temporary uninstaller process before returning.
+    import time
+    deadline = time.monotonic() + 60
+    while executable.exists() and time.monotonic() < deadline:
+        time.sleep(0.5)
+    require(not executable.exists(), 'NSIS uninstall left the installed app behind.')
+
+
+def check_installed(install, root, *, skip_app=False):
+    """Independent phases keep an app IPC failure from hiding runtime results."""
+    failures = []
+    state = root / 'workspace'
+    state.mkdir()
+
+    def attempt(phase, operation):
+        try:
+            operation()
+        except Exception as error:
+            failures.append(phase)
+            # Arbitrary exception values may contain fixture credentials. Only
+            # our fixed assertions and explicitly redacted logs are printable.
+            diagnostic = str(error) if isinstance(error, AcceptanceFailure) else type(error).__name__
+            print(phase + ' acceptance failed: ' + diagnostic, flush=True)
+            if phase == 'backend':
+                print(runtime_diagnostics(state), flush=True)
+
+    try:
+        if skip_app:
+            print('App activation/preload smoke SKIPPED: this run verifies the backend only.', flush=True)
+        else:
+            attempt('app', lambda: check_app(install / 'Kerix.exe', root / 'app-profile'))
+        attempt('backend', lambda: check_runtime(install / 'resources/personal-runtime', state))
+    finally:
+        attempt('uninstall', lambda: uninstall_app(install))
+    require(not failures, 'Installer acceptance failed in phase(s): ' + ', '.join(failures))
+
+
 def main():
     tag = os.environ.get('KERIX_RELEASE_TAG', '')
     match = re.fullmatch(r'v(\d+\.\d+\.\d+)-preview\.[1-9]\d*', tag)
     require(os.name == 'nt' and match is not None, 'Use a valid published preview tag on Windows.')
+    skip_app = os.environ.get('KERIX_SKIP_APP_SMOKE', '0')
+    require(skip_app in {'0', '1'}, 'Use KERIX_SKIP_APP_SMOKE=0 or 1 explicitly.')
+    expected_sha = os.environ.get('KERIX_EXPECTED_INSTALLER_SHA256', '')
+    require(not expected_sha or re.fullmatch(r'[a-f0-9]{64}', expected_sha), 'The optional expected installer checksum is invalid.')
     version = match.group(1)
     name = 'kerix-desktop-' + version + '-setup.exe'
     base = 'https://github.com/timmoyerr/kerix-downloads/releases/download/' + tag + '/'
@@ -208,25 +258,14 @@ def main():
         with installer.open('rb') as stream:
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         require(digest == checksums[name], 'The downloaded installer checksum differs.')
+        require(not expected_sha or digest == expected_sha, 'The installer differs from the explicitly selected candidate.')
+        print('Verified installer SHA256:', digest, flush=True)
         install = root / 'installed'
         completed = subprocess.run([str(installer), '/S', '/D=' + str(install)], timeout=180)
         require(completed.returncode == 0, 'Silent NSIS installation failed.')
         executable = install / 'Kerix.exe'
         require(executable.is_file(), 'NSIS did not install Kerix.')
-        try:
-            check_app(executable, root / 'app-profile')
-            state = root / 'workspace'; state.mkdir()
-            check_runtime(install / 'resources/personal-runtime', state)
-        finally:
-            uninstall = install / 'Uninstall Kerix.exe'
-            require(uninstall.is_file(), 'NSIS uninstaller is missing.')
-            subprocess.run([str(uninstall), '/S'], timeout=120, check=True)
-            # NSIS may spawn a temporary uninstaller process before returning.
-            import time
-            deadline = time.monotonic() + 60
-            while executable.exists() and time.monotonic() < deadline:
-                time.sleep(0.5)
-            require(not executable.exists(), 'NSIS uninstall left the installed app behind.')
+        check_installed(install, root, skip_app=skip_app == '1')
         print('Downloaded checksum, NSIS install and uninstall passed on Windows Server 2022.')
 
 

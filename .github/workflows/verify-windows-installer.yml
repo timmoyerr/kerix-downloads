@@ -8,6 +8,16 @@ on:
         required: false
         type: string
         default: ''
+      backend_only:
+        description: Skip Electron smoke and verify only the installed backend/database (not app acceptance)
+        required: false
+        type: boolean
+        default: false
+      installer_sha256:
+        description: Optional exact candidate SHA256 to prevent testing a replaced release asset
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -31,4 +41,10 @@ jobs:
         shell: pwsh
         env:
           KERIX_RELEASE_TAG: ${{ inputs.release_tag }}
+          KERIX_SKIP_APP_SMOKE: ${{ inputs.backend_only && '1' || '0' }}
+          KERIX_EXPECTED_INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
         run: python scripts/verify_windows_installer.py
+      - name: Verify acceptance phase isolation and diagnostic redaction
+        if: inputs.release_tag != ''
+        shell: pwsh
+        run: python -B -m unittest discover -s scripts -p 'test_*.py' -v
