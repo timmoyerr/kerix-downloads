@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import stat
 import unittest
 from unittest.mock import MagicMock, patch
+from zipfile import ZipFile, ZipInfo
 
 spec = importlib.util.spec_from_file_location('installer_acceptance', Path(__file__).with_name('verify_windows_installer.py'))
 acceptance = importlib.util.module_from_spec(spec)
@@ -108,6 +110,43 @@ class InstallerPhaseTests(unittest.TestCase):
         self.assertIn('acceptance.log: 0 bytes', report)
         self.assertIn('logs/database-initialize.log: unavailable', report)
         self.assertNotIn(str(self.root), report)
+
+    def test_probe_archive_refuses_traversal_absolute_paths_and_symlinks(self):
+        for name, linked in [('../outside', False), ('/absolute', False), ('postgres/../../outside', False),
+                             ('postgres/bin/linked', True), ('postgres/bin/tool.exe:stream', False)]:
+            with self.subTest(name=name):
+                archive = self.root / 'probe.zip'
+                with ZipFile(archive, 'w') as source:
+                    entry = ZipInfo(name)
+                    entry.external_attr = ((stat.S_IFLNK if linked else stat.S_IFREG) | 0o644) << 16
+                    source.writestr(entry, b'not executable')
+                with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'Unsafe PostgreSQL probe ZIP'):
+                    acceptance.extract_probe(archive, self.root / 'payload')
+                self.assertFalse((self.root / 'payload').exists())
+                self.assertFalse((self.root / 'outside').exists())
+
+    def test_system_import_diagnostic_uses_only_system32_and_reports_missing_exports(self):
+        import ctypes
+        runtime = self.root / 'runtime'
+        binary = runtime / 'postgres/bin/postgres.exe'
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b'not executed')
+        import hashlib
+        manifest = self.root / 'system-imports.json'
+        manifest.write_text(json.dumps({'schemaVersion': 1, 'binaries': {'postgres.exe': {'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}},
+                                        'systemImports': {'KERNEL32.dll': ['Present', 'Missing']}}))
+        kernel = MagicMock()
+        kernel.GetProcAddress.side_effect = lambda handle, name: None if name == b'Missing' else 1
+        library = MagicMock()
+        library._handle = 0x100000000
+        def load(name, **kwargs):
+            self.assertEqual(kwargs['winmode'], 0x800)
+            return kernel if name == 'kernel32.dll' else library
+        output = io.StringIO()
+        with patch.object(ctypes, 'WinDLL', side_effect=load, create=True), redirect_stdout(output):
+            acceptance.check_system_imports(runtime, manifest)
+        self.assertIn('Missing system export: KERNEL32.dll!Missing', output.getvalue())
+        self.assertIn('missing DLLs/exports: 1', output.getvalue())
 
 
 if __name__ == '__main__':

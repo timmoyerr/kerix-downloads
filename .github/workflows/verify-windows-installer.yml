@@ -18,6 +18,16 @@ on:
         required: false
         type: string
         default: ''
+      pg_probe_only:
+        description: Diagnostic only; execute the fixed PostgreSQL probe ZIP without installing or verifying the app
+        required: false
+        type: boolean
+        default: false
+      pg_probe_sha256:
+        description: Exact SHA256 required for the fixed PostgreSQL probe ZIP
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -43,6 +53,8 @@ jobs:
           KERIX_RELEASE_TAG: ${{ inputs.release_tag }}
           KERIX_SKIP_APP_SMOKE: ${{ inputs.backend_only && '1' || '0' }}
           KERIX_EXPECTED_INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+          KERIX_PG_PROBE_ONLY: ${{ inputs.pg_probe_only && '1' || '0' }}
+          KERIX_PG_PROBE_SHA256: ${{ inputs.pg_probe_sha256 }}
         run: python scripts/verify_windows_installer.py
       - name: Verify acceptance phase isolation and diagnostic redaction
         if: inputs.release_tag != ''

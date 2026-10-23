@@ -9,6 +9,10 @@ import re
 import subprocess
 import tempfile
 import threading
+import stat
+import unicodedata
+from pathlib import PurePosixPath
+from zipfile import ZipFile
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 from urllib.parse import quote, quote_plus
@@ -265,7 +269,84 @@ def check_postgres_tools(runtime, directory):
                 for stream in (child.stdout, child.stderr):
                     if stream and not stream.closed:
                         stream.close()
+    if failures:
+        check_system_imports(runtime)
     require(not failures, 'Installed PostgreSQL tool probes failed: ' + ', '.join(failures))
+
+
+def check_system_imports(runtime, manifest_path=None):
+    """Resolve only declared OS exports from System32, never application DLLs."""
+    manifest = json.loads(Path(manifest_path or Path(__file__).with_name('pg-windows-system-imports.json')).read_text())
+    for name, record in manifest['binaries'].items():
+        binary = runtime / 'postgres/bin' / name
+        if not binary.is_file() or hashlib.sha256(binary.read_bytes()).hexdigest() != record['sha256']:
+            print('System import preflight SKIPPED: supplied binary inventory differs.', flush=True)
+            return
+    import ctypes
+    kernel = ctypes.WinDLL('kernel32.dll', use_last_error=True, winmode=0x800)
+    kernel.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    kernel.GetProcAddress.restype = ctypes.c_void_p
+    missing = 0
+    for name, symbols in sorted(manifest['systemImports'].items()):
+        require(re.fullmatch(r'[A-Za-z0-9_.-]+\.dll', name), 'Invalid diagnostic system DLL name.')
+        try:
+            library = ctypes.WinDLL(name, use_last_error=True, winmode=0x800)
+        except OSError as error:
+            missing += 1
+            print('Missing system DLL: ' + name + ' winerror=' + str(getattr(error, 'winerror', None)), flush=True)
+            continue
+        for symbol in symbols:
+            require(re.fullmatch(r'[A-Za-z0-9_?@$]+', symbol), 'Invalid diagnostic system export name.')
+            if not kernel.GetProcAddress(library._handle, symbol.encode('ascii')):
+                missing += 1
+                print('Missing system export: ' + name + '!' + symbol, flush=True)
+    print('System import preflight missing DLLs/exports: ' + str(missing), flush=True)
+
+
+def extract_probe(archive, destination):
+    """Only regular files below postgres/ may leave this fixed hash-pinned ZIP."""
+    reserved = {'con', 'prn', 'aux', 'nul', *('com' + str(i) for i in range(1, 10)), *('lpt' + str(i) for i in range(1, 10))}
+    with ZipFile(archive) as source:
+        members = source.infolist()
+        require(len(members) <= 5000 and sum(item.file_size for item in members) <= 512 * 1024 * 1024,
+                'PostgreSQL probe ZIP exceeds its extraction limit.')
+        seen = set()
+        for member in members:
+            name = member.filename
+            parts = PurePosixPath(name).parts
+            key = unicodedata.normalize('NFC', name.rstrip('/')).casefold()
+            kind = stat.S_IFMT(member.external_attr >> 16)
+            require(parts and parts[0] == 'postgres' and not PurePosixPath(name).is_absolute()
+                    and '\\' not in name and len(name) <= 1024 and key not in seen
+                    and kind in {0, stat.S_IFREG, stat.S_IFDIR}
+                    and all(part not in {'.', '..'} and part[-1:] not in {' ', '.'}
+                            and part.split('.')[0].casefold() not in reserved
+                            and not any(ord(character) < 32 or character in '<>:"|?*' for character in part) for part in parts),
+                    'Unsafe PostgreSQL probe ZIP member.')
+            seen.add(key)
+        destination.mkdir()
+        for member in members:
+            target = destination.joinpath(*PurePosixPath(member.filename).parts)
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with source.open(member) as input_, target.open('xb') as output:
+                    while chunk := input_.read(1024 * 1024):
+                        output.write(chunk)
+
+
+def probe_only(base, expected_sha):
+    require(re.fullmatch(r'[a-f0-9]{64}', expected_sha), 'An exact PostgreSQL probe SHA256 is required.')
+    with tempfile.TemporaryDirectory(prefix='kerix-postgres-only-') as directory:
+        root = Path(directory)
+        archive = root / 'probe.zip'
+        fetch(base + 'kerix-postgresql-16.13-win32-x64-probe.zip', archive, 64 * 1024 * 1024)
+        require(hashlib.sha256(archive.read_bytes()).hexdigest() == expected_sha, 'PostgreSQL probe checksum differs.')
+        print('Verified PostgreSQL probe SHA256:', expected_sha, flush=True)
+        print('PG-ONLY diagnostic: app, installer and Python/backend acceptance are NOT performed.', flush=True)
+        extract_probe(archive, root / 'payload')
+        check_postgres_tools(root / 'payload', root / 'probe-state')
 
 
 def runtime_command(runtime):
@@ -340,6 +421,11 @@ def main():
     version = match.group(1)
     name = 'kerix-desktop-' + version + '-setup.exe'
     base = 'https://github.com/timmoyerr/kerix-downloads/releases/download/' + tag + '/'
+    pg_only = os.environ.get('KERIX_PG_PROBE_ONLY', '0')
+    require(pg_only in {'0', '1'}, 'Use KERIX_PG_PROBE_ONLY=0 or 1 explicitly.')
+    if pg_only == '1':
+        probe_only(base, os.environ.get('KERIX_PG_PROBE_SHA256', ''))
+        return
     with tempfile.TemporaryDirectory(prefix='kerix-installer-acceptance-') as directory:
         root = Path(directory)
         checksum_path, installer = root / 'SHA256SUMS', root / name
