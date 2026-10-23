@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import tempfile
 import stat
+import subprocess
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 from zipfile import ZipFile, ZipInfo
@@ -147,6 +149,58 @@ class InstallerPhaseTests(unittest.TestCase):
             acceptance.check_system_imports(runtime, manifest)
         self.assertIn('Missing system export: KERNEL32.dll!Missing', output.getvalue())
         self.assertIn('missing DLLs/exports: 1', output.getvalue())
+
+    def test_acl_retry_grants_only_current_sid_rx_on_owned_pg_tree(self):
+        runtime = self.root / 'payload'
+        postgres = runtime / 'postgres'
+        (postgres / 'bin').mkdir(parents=True)
+        principal, sid = r'SYNTHETIC\runner', 'S-1-5-21-123-456-789-1001'
+        environment = {'SystemRoot': r'C:\Windows', 'PATH': 'fixed-system-path'}
+        companion = MagicMock()
+        companion.probe_restricted_initdb.return_value = {'exitCode': 0}
+        def command(arguments, **kwargs):
+            self.assertEqual(kwargs['env'], environment)
+            if arguments[0].endswith('whoami.exe'):
+                output = ('"' + principal + '","' + sid + '"\n').encode()
+            else:
+                output = (str(postgres) + ' ' + principal + ':(F)\n').encode()
+            return subprocess.CompletedProcess(arguments, 0, output, b'')
+        output = io.StringIO()
+        with (patch.object(acceptance.subprocess, 'run', side_effect=command) as run,
+              patch.object(acceptance, 'run_postgres_probe', return_value=True) as retry,
+              patch.dict(sys.modules, {'restricted_token_probe': companion}), redirect_stdout(output)):
+            acceptance.restricted_acl_diagnostics(runtime, self.root, environment)
+        grants = [call.args[0] for call in run.call_args_list if '/grant' in call.args[0]]
+        self.assertEqual(grants, [[str(Path(r'C:\Windows') / 'System32/icacls.exe'), str(postgres),
+                                   '/grant', '*' + sid + ':(OI)(CI)RX', '/T', '/Q']])
+        retry.assert_called_once()
+        self.assertEqual(retry.call_args.args[0], 'initdb-explicit-user-rx')
+        self.assertIn('--auth-host=reject', retry.call_args.args[1])
+        self.assertNotIn('PG_RESTRICT_EXEC', environment)
+        companion.probe_restricted_initdb.assert_called_once_with(postgres / 'bin', self.root / 'restricted-child', environment)
+        self.assertNotIn(principal, output.getvalue())
+        self.assertNotIn(sid, output.getvalue())
+        self.assertIn('does not override the original package probe failure', output.getvalue())
+
+    def test_successful_diagnostic_does_not_hide_baseline_package_failure(self):
+        with (patch.object(acceptance, 'run_postgres_probe', side_effect=[True, True, False]),
+              patch.object(acceptance, 'check_system_imports'),
+              patch.object(acceptance, 'restricted_acl_diagnostics') as diagnostic,
+              redirect_stdout(io.StringIO())):
+            with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'initdb-reject-auth'):
+                acceptance.check_postgres_tools(self.install, self.root / 'probe', restricted_diagnostics=True)
+        diagnostic.assert_called_once()
+
+    def test_acl_query_error_does_not_prevent_restricted_child_probe(self):
+        companion = MagicMock()
+        companion.probe_restricted_initdb.return_value = {'exitCode': 0}
+        output = io.StringIO()
+        with (patch.object(acceptance, 'postgres_acl_retry', side_effect=OSError(5, 'synthetic private message')),
+              patch.dict(sys.modules, {'restricted_token_probe': companion}), redirect_stdout(output)):
+            acceptance.restricted_acl_diagnostics(self.install, self.root, {})
+        companion.probe_restricted_initdb.assert_called_once()
+        self.assertIn('Narrow PG ACL diagnostic unavailable: OSError', output.getvalue())
+        self.assertNotIn('synthetic private message', output.getvalue())
 
 
 if __name__ == '__main__':

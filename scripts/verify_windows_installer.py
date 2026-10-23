@@ -1,5 +1,6 @@
 """Public, credential-free acceptance for the published Kerix Windows preview."""
 import base64
+import csv
 import hashlib
 import json
 import os
@@ -228,7 +229,90 @@ def probe_output(value):
     return '\n'.join(output)[-8000:]
 
 
-def check_postgres_tools(runtime, directory):
+def run_postgres_probe(name, command, directory, environment):
+    """Return probe success while always reporting its exact safe exit status."""
+    child = None
+    try:
+        child = subprocess.Popen(command, cwd=directory, env=environment, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+        timed_out = False
+        try:
+            stdout, stderr = child.communicate(timeout=90)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            taskkill = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/taskkill.exe')
+            subprocess.run([taskkill, '/PID', str(child.pid), '/T', '/F'], capture_output=True, timeout=20)
+            stdout, stderr = child.communicate(timeout=15)
+        print(name + ' exit status: ' + exit_status(child.returncode), flush=True)
+        if timed_out:
+            print(name + ' exceeded the bounded probe timeout.', flush=True)
+        for label, content in (('stdout', stdout), ('stderr', stderr)):
+            print(name + ' ' + label + ': ' + str(len(content)) + ' bytes', flush=True)
+            if content:
+                print(probe_output(content), flush=True)
+        return not timed_out and child.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(name + ' process failure: ' + type(error).__name__ + ' errno=' + str(getattr(error, 'errno', None)) + ' winerror=' + str(getattr(error, 'winerror', None)), flush=True)
+        return False
+    finally:
+        if child is not None:
+            if child.poll() is None:
+                cleanup_runtime(child)
+            for stream in (child.stdout, child.stderr):
+                if stream and not stream.closed:
+                    stream.close()
+
+
+def postgres_acl_retry(runtime, directory, environment):
+    """Only an extracted, owned PG tree receives the diagnostic user RX ACE."""
+    system = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32'
+    identity = subprocess.run([str(system / 'whoami.exe'), '/user', '/fo', 'csv', '/nh'],
+                              env=environment, capture_output=True, timeout=20, check=True)
+    rows = list(csv.reader(identity.stdout.decode('utf-8', errors='replace').splitlines()))
+    require(len(rows) == 1 and len(rows[0]) == 2 and re.fullmatch(r'S-1-\d+(?:-\d+){1,15}', rows[0][1]),
+            'The diagnostic current-user SID is unavailable.')
+    principal, sid = rows[0]
+    postgres = runtime / 'postgres'
+    require(postgres.is_dir() and not postgres.is_symlink(), 'The owned diagnostic PostgreSQL tree is unavailable.')
+    icacls = str(system / 'icacls.exe')
+    for relative in ('', 'bin', 'bin/initdb.exe', 'bin/libpq.dll'):
+        result = subprocess.run([icacls, str(postgres / relative)], env=environment,
+                                capture_output=True, timeout=20)
+        print('PG ACL ' + (relative or '.') + ' query exit status: ' + exit_status(result.returncode), flush=True)
+        raw = result.stdout + result.stderr
+        for value, replacement in ((str(postgres), '<POSTGRES>'), (principal, '<CURRENT_USER>'), (sid, '<CURRENT_USER_SID>')):
+            raw = raw.replace(value.encode('utf-8'), replacement.encode('ascii'))
+        if raw:
+            print(probe_output(raw), flush=True)
+    # Use an explicit SID, never a name lookup, and never change the workspace,
+    # data directories, parent folders or any Windows/system directory ACLs.
+    result = subprocess.run([icacls, str(postgres), '/grant', '*' + sid + ':(OI)(CI)RX', '/T', '/Q'],
+                            env=environment, capture_output=True, timeout=60)
+    print('PG-tree-only current-user RX grant exit status: ' + exit_status(result.returncode), flush=True)
+    if result.returncode:
+        print('PG-tree ACL retry unavailable: the narrow grant failed.', flush=True)
+        return
+    binary = postgres / 'bin'
+    retry = ['--auth-host=reject', '--auth-local=reject', '--username=kerix_owner', '--encoding=UTF8', '--locale=C',
+             '-D', str(directory / 'postgres-explicit-user-rx')]
+    run_postgres_probe('initdb-explicit-user-rx', [str(binary / 'initdb.exe'), *retry], directory, environment)
+    print('The ACL retry is diagnostic only; it does not override the original package probe failure.', flush=True)
+
+
+def restricted_acl_diagnostics(runtime, directory, environment):
+    try:
+        postgres_acl_retry(runtime, directory, environment)
+    except Exception as error:
+        print('Narrow PG ACL diagnostic unavailable: ' + type(error).__name__, flush=True)
+    # The companion probe creates a real source-equivalent restricted token;
+    # it does not set PG_RESTRICT_EXEC or weaken PostgreSQL's self-restriction.
+    from restricted_token_probe import probe_restricted_initdb
+    report = probe_restricted_initdb(runtime / 'postgres/bin', directory / 'restricted-child', environment)
+    require(isinstance(report, dict), 'The restricted-child diagnostic supplied an invalid report.')
+    print('Restricted initdb-version child diagnostic:', probe_output(json.dumps(report, sort_keys=True).encode()), flush=True)
+
+
+def check_postgres_tools(runtime, directory, *, restricted_diagnostics=False):
     """Loader/initdb contrast outside the runtime's private Windows job."""
     directory.mkdir()
     binary = runtime / 'postgres/bin'
@@ -241,36 +325,15 @@ def check_postgres_tools(runtime, directory):
                                       '--username=kerix_owner', '--encoding=UTF8', '--locale=C', '-D', str(directory / 'postgres')])]
     failures = []
     for name, command in probes:
-        child = None
-        try:
-            child = subprocess.Popen(command, cwd=directory, env=environment, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
-            try:
-                stdout, stderr = child.communicate(timeout=90)
-            except subprocess.TimeoutExpired:
-                taskkill = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/taskkill.exe')
-                subprocess.run([taskkill, '/PID', str(child.pid), '/T', '/F'], capture_output=True, timeout=20)
-                stdout, stderr = child.communicate(timeout=15)
-                failures.append(name + '-timeout')
-            print(name + ' exit status: ' + exit_status(child.returncode), flush=True)
-            for label, content in (('stdout', stdout), ('stderr', stderr)):
-                print(name + ' ' + label + ': ' + str(len(content)) + ' bytes', flush=True)
-                if content:
-                    print(probe_output(content), flush=True)
-            if child.returncode != 0:
-                failures.append(name)
-        except (OSError, subprocess.TimeoutExpired) as error:
+        if not run_postgres_probe(name, command, directory, environment):
             failures.append(name)
-            print(name + ' process failure: ' + type(error).__name__ + ' errno=' + str(getattr(error, 'errno', None)) + ' winerror=' + str(getattr(error, 'winerror', None)), flush=True)
-        finally:
-            if child is not None:
-                if child.poll() is None:
-                    cleanup_runtime(child)
-                for stream in (child.stdout, child.stderr):
-                    if stream and not stream.closed:
-                        stream.close()
     if failures:
         check_system_imports(runtime)
+        if restricted_diagnostics:
+            try:
+                restricted_acl_diagnostics(runtime, directory, environment)
+            except Exception as error:
+                print('Restricted-child diagnostic unavailable: ' + type(error).__name__, flush=True)
     require(not failures, 'Installed PostgreSQL tool probes failed: ' + ', '.join(failures))
 
 
@@ -346,7 +409,7 @@ def probe_only(base, expected_sha):
         print('Verified PostgreSQL probe SHA256:', expected_sha, flush=True)
         print('PG-ONLY diagnostic: app, installer and Python/backend acceptance are NOT performed.', flush=True)
         extract_probe(archive, root / 'payload')
-        check_postgres_tools(root / 'payload', root / 'probe-state')
+        check_postgres_tools(root / 'payload', root / 'probe-state', restricted_diagnostics=True)
 
 
 def runtime_command(runtime):
