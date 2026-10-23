@@ -43,12 +43,16 @@ def runtime_diagnostics(data):
         path = data / name
         try:
             if path.is_symlink():
+                result.append(name + ': linked log withheld')
                 continue
+            size = path.stat().st_size
+            result.append(name + ': ' + str(size) + ' bytes')
             with path.open('rb') as stream:
                 stream.seek(0, 2)
                 stream.seek(max(0, stream.tell() - 16384))
                 lines = stream.read(16384).decode('utf-8', errors='replace').splitlines()[-20:]
-        except OSError:
+        except OSError as error:
+            result.append(name + ': unavailable (' + type(error).__name__ + ', errno=' + str(error.errno) + ')')
             continue
         cleaned = []
         for line in lines:
@@ -116,6 +120,7 @@ def check_runtime(runtime, state):
                         'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'}}
         command = runtime_command(runtime)
         child = None
+        failure = None
         with (state / 'acceptance.log').open('ab') as log:
             try:
                 child = subprocess.Popen(command + ['--state-dir', str(state), '--postgres-root', str(runtime / 'postgres')],
@@ -151,25 +156,116 @@ def check_runtime(runtime, state):
                 require(first_secrets is None or first_secrets == current_secrets, 'Private credentials changed on restart.')
                 owner, first_secrets = current_owner, current_secrets
             except BaseException as error:
-                error.add_note(runtime_diagnostics(state))
+                failure = error
                 raise
             finally:
-                if child:
-                    if child.poll() is None:
-                        try:
-                            child.stdin.write(b'stop\n')
-                            child.stdin.flush()
-                            child.stdin.close()
-                            child.wait(timeout=55)
-                        except (OSError, subprocess.TimeoutExpired):
-                            subprocess.run(['taskkill', '/PID', str(child.pid), '/T', '/F'], capture_output=True, timeout=20)
-                            child.wait(timeout=15)
-                    for stream in (child.stdin, child.stdout, child.stderr):
-                        if stream and not stream.closed:
-                            stream.close()
+                issues = cleanup_runtime(child)
+                print('Runtime exit status:', exit_status(child.returncode if child else None), flush=True)
+                if issues:
+                    print('Runtime cleanup diagnostics (classes/numeric codes only): ' + ', '.join(issues), flush=True)
+                if failure is not None:
+                    failure.add_note(runtime_diagnostics(state))
+                elif issues:
+                    raise AcceptanceFailure('Runtime cleanup failed.')
         require(child.returncode == 0, 'Backend did not shut down cleanly.')
         require(not (state / 'postgres/postmaster.pid').exists(), 'Backend left its PostgreSQL process running.')
     print('Bundled Python/PostgreSQL initialized, migrated, stayed locked, preserved state and shut down twice.')
+
+
+def exit_status(value):
+    return 'unavailable' if value is None else str(value) + ' (0x' + format(value & 0xffffffff, '08X') + ')'
+
+
+def cleanup_runtime(child):
+    """Never replace the first failure with Windows pipe flush/close errors."""
+    if child is None:
+        return []
+    issues = []
+    def attempt(name, operation):
+        try:
+            operation()
+            return True
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            issues.append(name + ':' + type(error).__name__ + ':errno=' + str(getattr(error, 'errno', None)) + ':winerror=' + str(getattr(error, 'winerror', None)))
+            return False
+    try:
+        try:
+            running = child.poll() is None
+        except OSError as error:
+            issues.append('poll:' + type(error).__name__ + ':errno=' + str(error.errno) + ':winerror=' + str(getattr(error, 'winerror', None)))
+            running = True
+        if running and child.stdin is not None:
+            attempt('stop-write', lambda: child.stdin.write(b'stop\n'))
+            attempt('stop-flush', child.stdin.flush)
+        if child.stdin is not None:
+            attempt('stdin-close', child.stdin.close)
+        if not attempt('wait', lambda: child.wait(timeout=55)):
+            taskkill = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/taskkill.exe')
+            attempt('owned-tree-stop', lambda: subprocess.run([taskkill, '/PID', str(child.pid), '/T', '/F'], capture_output=True, timeout=20))
+            if not attempt('tree-wait', lambda: child.wait(timeout=15)):
+                attempt('kill', child.kill)
+                attempt('kill-wait', lambda: child.wait(timeout=10))
+    finally:
+        for name in ('stdin', 'stdout', 'stderr'):
+            stream = getattr(child, name, None)
+            if stream is not None and not stream.closed:
+                attempt(name + '-close', stream.close)
+    return issues
+
+
+def probe_output(value):
+    """These probes never receive credentials, environment secrets or sessions."""
+    output = []
+    for line in value.decode('utf-8', errors='replace').splitlines()[-30:]:
+        if re.search(r'://|password|authorization|signing_key|secret_key|(?:access|refresh)[_-]?token|[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}', line, re.I):
+            output.append('[sensitive probe diagnostic omitted]')
+        else:
+            output.append(line[:600])
+    return '\n'.join(output)[-8000:]
+
+
+def check_postgres_tools(runtime, directory):
+    """Loader/initdb contrast outside the runtime's private Windows job."""
+    directory.mkdir()
+    binary = runtime / 'postgres/bin'
+    environment = {name: value for name, value in os.environ.items() if name in
+                   {'HOME', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'}}
+    environment.update(PATH=str(binary) + os.pathsep + str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32'), LANG='C', LC_ALL='C')
+    probes = [('postgres-version', [str(binary / 'postgres.exe'), '--version']),
+              ('initdb-version', [str(binary / 'initdb.exe'), '--version']),
+              ('initdb-reject-auth', [str(binary / 'initdb.exe'), '--auth-host=reject', '--auth-local=reject',
+                                      '--username=kerix_owner', '--encoding=UTF8', '--locale=C', '-D', str(directory / 'postgres')])]
+    failures = []
+    for name, command in probes:
+        child = None
+        try:
+            child = subprocess.Popen(command, cwd=directory, env=environment, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+            try:
+                stdout, stderr = child.communicate(timeout=90)
+            except subprocess.TimeoutExpired:
+                taskkill = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/taskkill.exe')
+                subprocess.run([taskkill, '/PID', str(child.pid), '/T', '/F'], capture_output=True, timeout=20)
+                stdout, stderr = child.communicate(timeout=15)
+                failures.append(name + '-timeout')
+            print(name + ' exit status: ' + exit_status(child.returncode), flush=True)
+            for label, content in (('stdout', stdout), ('stderr', stderr)):
+                print(name + ' ' + label + ': ' + str(len(content)) + ' bytes', flush=True)
+                if content:
+                    print(probe_output(content), flush=True)
+            if child.returncode != 0:
+                failures.append(name)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failures.append(name)
+            print(name + ' process failure: ' + type(error).__name__ + ' errno=' + str(getattr(error, 'errno', None)) + ' winerror=' + str(getattr(error, 'winerror', None)), flush=True)
+        finally:
+            if child is not None:
+                if child.poll() is None:
+                    cleanup_runtime(child)
+                for stream in (child.stdout, child.stderr):
+                    if stream and not stream.closed:
+                        stream.close()
+    require(not failures, 'Installed PostgreSQL tool probes failed: ' + ', '.join(failures))
 
 
 def runtime_command(runtime):
@@ -226,6 +322,7 @@ def check_installed(install, root, *, skip_app=False):
             print('App activation/preload smoke SKIPPED: this run verifies the backend only.', flush=True)
         else:
             attempt('app', lambda: check_app(install / 'Kerix.exe', root / 'app-profile'))
+        attempt('postgres-probes', lambda: check_postgres_tools(install / 'resources/personal-runtime', root / 'postgres-probes'))
         attempt('backend', lambda: check_runtime(install / 'resources/personal-runtime', state))
     finally:
         attempt('uninstall', lambda: uninstall_app(install))
