@@ -11,8 +11,60 @@ import tempfile
 import threading
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
+from urllib.parse import quote, quote_plus
 
 OPENER = build_opener(ProxyHandler({}))
+
+
+def runtime_diagnostics(data):
+    """Read only this generated fixture's logs; never expose its credentials."""
+    secrets = []
+    try:
+        path = data / 'secrets.json'
+        if path.is_symlink() or path.stat().st_size > 4096:
+            raise ValueError
+        values = json.loads(path.read_bytes())
+        if set(values) != {'database_password', 'signing_key'} or any(not isinstance(value, str) or not value for value in values.values()):
+            raise ValueError
+        for value in values.values():
+            secrets.extend((value, quote(value, safe=''), quote_plus(value), json.dumps(value)[1:-1]))
+    except (OSError, ValueError, TypeError):
+        pass
+    safe_runtime = re.compile(r'^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Failure|Exception) at [A-Za-z0-9_.,: <>-]+|Missing bundled module: [A-Za-z0-9_.]+|Kerix could not start its private runtime\. Existing user data is preserved\.)$')
+    sensitive = re.compile(r'://|password|signing_key|secret_key|database_url|authorization|(?:access|refresh)[_-]?token|connection[_ -]?(?:key|url)|\bdsn\b', re.I)
+    jwt = re.compile(r'[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}')
+    result = []
+    files = ('acceptance.log', 'logs/database-initialize.log', 'logs/database-start.log', 'logs/database.log', 'logs/database-stop.log')
+    for name in files:
+        path = data / name
+        try:
+            if path.is_symlink():
+                continue
+            with path.open('rb') as stream:
+                stream.seek(0, 2)
+                stream.seek(max(0, stream.tell() - 16384))
+                lines = stream.read(16384).decode('utf-8', errors='replace').splitlines()[-20:]
+        except OSError:
+            continue
+        cleaned = []
+        for line in lines:
+            for value in sorted(set(secrets), key=len, reverse=True):
+                line = line.replace(value, '[REDACTED]')
+            line = jwt.sub('[REDACTED TOKEN]', line)
+            if sensitive.search(line):
+                # Keep a useful fixed diagnostic phrase, never the original
+                # credential-bearing line or a database connection URL.
+                phrases = ('permission denied', 'access is denied', 'invalid locale', 'dll load failed', 'could not execute', 'could not create directory')
+                reason = next((value for value in phrases if value in line.lower()), None)
+                line = '[sensitive line omitted' + ('; ' + reason if reason else '') + ']'
+            elif not secrets and not safe_runtime.fullmatch(line.strip()):
+                continue  # Redaction unavailable: raw database diagnostics withheld.
+            cleaned.append(line[:600])
+        if cleaned:
+            result.append(name + ':\n' + '\n'.join(cleaned)[-2500:])
+    if not secrets:
+        result.append('Fixture credential redaction unavailable; raw database diagnostics withheld.')
+    return '\n'.join(result)[:8000] or 'No runtime diagnostics were available.'
 
 
 def require(condition, message):
@@ -87,6 +139,9 @@ def check_runtime(runtime, state):
                 require(owner is None or owner == current_owner, 'Workspace owner changed on restart.')
                 require(first_secrets is None or first_secrets == current_secrets, 'Private credentials changed on restart.')
                 owner, first_secrets = current_owner, current_secrets
+            except BaseException as error:
+                error.add_note(runtime_diagnostics(state))
+                raise
             finally:
                 if child:
                     if child.poll() is None:
