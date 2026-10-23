@@ -1,0 +1,34 @@
+name: Verify Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published preview tag to verify (leave blank to check runner availability)
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Confirm standard public Windows runner
+        shell: pwsh
+        run: |
+          Write-Output "Windows runner is available for installer acceptance."
+          python --version
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        if: inputs.release_tag != ''
+        with:
+          persist-credentials: false
+      - name: Verify published installer
+        if: inputs.release_tag != ''
+        shell: pwsh
+        env:
+          KERIX_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: python scripts/verify_windows_installer.py
