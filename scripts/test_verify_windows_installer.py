@@ -1,5 +1,6 @@
 """Synthetic acceptance orchestration and fixture-redaction regressions."""
 from contextlib import redirect_stdout
+import base64
 import importlib.util
 import io
 import json
@@ -10,6 +11,7 @@ import stat
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zipfile import ZipFile, ZipInfo
 
@@ -237,6 +239,105 @@ class InstallerPhaseTests(unittest.TestCase):
             with self.subTest(output=output), patch.object(acceptance.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, output, b'')):
                 with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'current-user SID is unavailable'):
                     acceptance.current_user_identity({})
+
+
+class RuntimeBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='kerix-bootstrap-test-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.runtime = self.root / 'runtime'
+        self.source = self.runtime / 'backend/app/desktop_runtime.py'
+        self.source.parent.mkdir(parents=True)
+        self.source.write_text('def read_parent_bootstrap(stream):\n    pass\n')
+        self.key = '0123456789abcdef' * 4
+
+    def test_both_runtime_starts_receive_one_private_key_and_flush_before_handoff(self):
+        state = self.root / 'workspace'
+        state.mkdir()
+        (state / 'secrets.json').write_text(json.dumps({'database_password': 'fixture-db', 'signing_key': 'fixture-signing'}))
+        owner = base64.urlsafe_b64encode(b'{"sub":"fixture-owner"}').decode().rstrip('=')
+        handoff = json.dumps({'apiBaseUrl': 'http://127.0.0.1:45001/api/v1',
+            'session': {'accessToken': 'header.' + owner + '.signature', 'refreshToken': 'fixture-refresh'}}).encode() + b'\n'
+        children, wire = [], []
+
+        def spawn(arguments, **kwargs):
+            self.assertNotIn(self.key, repr(arguments))
+            self.assertNotIn(self.key, repr(kwargs['env']))
+            child = MagicMock()
+            child.returncode = 0
+            child.stdin.write.side_effect = lambda message: wire.append(message) or len(message)
+            def read(_limit):
+                child.stdin.flush.assert_called_once()
+                self.assertEqual(json.loads(wire[-1]), {'version': 1, 'githubTokenEncryptionKey': self.key})
+                return handoff
+            child.stdout.readline.side_effect = read
+            children.append(child)
+            return child
+
+        def open_api(request, **kwargs):
+            if isinstance(request, str):
+                response = MagicMock(); response.status = 200
+                response.__enter__.return_value = response
+                return response
+            raise acceptance.HTTPError(request.full_url, 402, 'License required', {},
+                io.BytesIO(b'{"detail":{"code":"LICENSE_REQUIRED"}}'))
+
+        output = io.StringIO()
+        with (patch.object(acceptance.secrets, 'token_urlsafe', return_value=self.key) as random_key,
+              patch.object(acceptance, 'runtime_command', return_value=['fixture-runtime']),
+              patch.object(acceptance.subprocess, 'Popen', side_effect=spawn),
+              patch.object(acceptance.subprocess, 'CREATE_NO_WINDOW', 0, create=True),
+              patch.object(acceptance.threading, 'Thread', side_effect=lambda *, target, daemon: SimpleNamespace(start=target)),
+              patch.object(acceptance.OPENER, 'open', side_effect=open_api),
+              patch.object(acceptance, 'cleanup_runtime', return_value=[]), redirect_stdout(output)):
+            acceptance.check_runtime(self.runtime, state)
+        random_key.assert_called_once_with(48)
+        self.assertEqual(len(children), 2)
+        self.assertEqual(wire[0], wire[1])
+        self.assertTrue(wire[0].endswith(b'\n'))
+        self.assertEqual(wire[0].count(b'\n'), 1)
+        self.assertNotIn(self.key, output.getvalue())
+        self.assertTrue(all(self.key.encode() not in entry.read_bytes() for entry in state.rglob('*') if entry.is_file()))
+        self.assertIn('preserved state and shut down twice', output.getvalue())
+
+    def test_legacy_runtime_gets_no_bootstrap_shutdown_line_and_low_diversity_is_retried(self):
+        self.source.write_text('def main():\n    pass\n')
+        with patch.object(acceptance.secrets, 'token_urlsafe') as random_key:
+            self.assertIsNone(acceptance.runtime_parent_bootstrap(self.runtime))
+        random_key.assert_not_called()
+        self.source.write_text('def read_parent_bootstrap(stream):\n    pass\n')
+        with patch.object(acceptance.secrets, 'token_urlsafe', side_effect=['0' * 64, self.key]) as random_key:
+            message = acceptance.runtime_parent_bootstrap(self.runtime)
+        self.assertEqual(random_key.call_count, 2)
+        self.assertEqual(json.loads(message)['githubTokenEncryptionKey'], self.key)
+
+    def test_bootstrap_pipe_failure_reports_only_the_error_class_and_still_uninstalls(self):
+        child = MagicMock(); child.returncode = 1
+        child.stdin.flush.side_effect = OSError(22, 'private fixture key ' + self.key)
+        output = io.StringIO()
+        bootstrap = (json.dumps({'version': 1, 'githubTokenEncryptionKey': self.key}) + '\n').encode()
+        with (patch.object(acceptance, 'runtime_parent_bootstrap', return_value=bootstrap),
+              patch.object(acceptance, 'runtime_command', return_value=['fixture-runtime']),
+              patch.object(acceptance.subprocess, 'Popen', return_value=child),
+              patch.object(acceptance.subprocess, 'CREATE_NO_WINDOW', 0, create=True),
+              patch.object(acceptance, 'cleanup_runtime', return_value=[]),
+              patch.object(acceptance, 'check_app'), patch.object(acceptance, 'check_postgres_tools'),
+              patch.object(acceptance, 'uninstall_app') as uninstall, redirect_stdout(output)):
+            with self.assertRaisesRegex(acceptance.AcceptanceFailure, r'phase\(s\): backend$'):
+                acceptance.check_installed(self.runtime.parent, self.root)
+        uninstall.assert_called_once()
+        self.assertIn('backend acceptance failed: OSError', output.getvalue())
+        self.assertNotIn(self.key, output.getvalue())
+
+    def test_diagnostics_withhold_a_bootstrap_field_in_database_output(self):
+        state = self.root / 'workspace'; state.mkdir()
+        (state / 'secrets.json').write_text(json.dumps({'database_password': 'fixture-db', 'signing_key': 'fixture-signing'}))
+        (state / 'logs').mkdir()
+        (state / 'logs/database.log').write_text(json.dumps({'version': 1, 'githubTokenEncryptionKey': self.key}) + '\n')
+        diagnostic = acceptance.runtime_diagnostics(state)
+        self.assertNotIn(self.key, diagnostic)
+        self.assertIn('[sensitive line omitted]', diagnostic)
 
 
 if __name__ == '__main__':

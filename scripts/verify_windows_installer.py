@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import secrets
 import subprocess
 import tempfile
 import threading
@@ -88,7 +89,7 @@ def runtime_diagnostics(data):
     except (OSError, ValueError, TypeError):
         pass
     safe_runtime = re.compile(r'^(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Failure|Exception) at [A-Za-z0-9_.,: <>-]+|Missing bundled module: [A-Za-z0-9_.]+|Kerix could not start its private runtime\. Existing user data is preserved\.)$')
-    sensitive = re.compile(r'://|password|signing_key|secret_key|database_url|authorization|(?:access|refresh)[_-]?token|connection[_ -]?(?:key|url)|\bdsn\b', re.I)
+    sensitive = re.compile(r'://|password|signing_key|secret_key|github[_ -]?token[_ -]?encryption[_ -]?key|database_url|authorization|(?:access|refresh)[_-]?token|connection[_ -]?(?:key|url)|\bdsn\b', re.I)
     jwt = re.compile(r'[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}')
     result = []
     files = ('acceptance.log', 'logs/database-initialize.log', 'logs/database-start.log', 'logs/database.log', 'logs/database-stop.log')
@@ -163,10 +164,32 @@ def check_app(executable, profile):
     print('Installed Electron activation gate and preload passed.')
 
 
+def runtime_parent_bootstrap(runtime):
+    """Match the installed runtime protocol without stopping older previews.
+
+    Legacy runtimes treat their first stdin line as a shutdown request. Only
+    send the new bootstrap when the verified installed source consumes it.
+    The generated fixture key is never persisted or put in environment/argv.
+    """
+    source = runtime / 'backend/app/desktop_runtime.py'
+    if not source.is_file():
+        return None
+    with source.open('rb') as stream:
+        content = stream.read(1024 * 1024 + 1)
+    require(len(content) <= 1024 * 1024, 'The installed runtime protocol source is invalid.')
+    if b'def read_parent_bootstrap(' not in content:
+        return None
+    key = secrets.token_urlsafe(48)
+    while len(set(key)) < 12:
+        key = secrets.token_urlsafe(48)
+    return (json.dumps({'version': 1, 'githubTokenEncryptionKey': key}) + '\n').encode('ascii')
+
+
 def check_runtime(runtime, state):
     """Launch twice from an empty private workspace and verify backend locking."""
     owner = None
     first_secrets = None
+    bootstrap = runtime_parent_bootstrap(runtime)
     for _ in range(2):
         environment = {name: value for name, value in os.environ.items() if name in
                        {'HOME', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP',
@@ -179,6 +202,9 @@ def check_runtime(runtime, state):
                 child = subprocess.Popen(command + ['--state-dir', str(state), '--postgres-root', str(runtime / 'postgres')],
                                          cwd=state, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
+                if bootstrap is not None:
+                    child.stdin.write(bootstrap)
+                    child.stdin.flush()
                 handoff = queue.Queue()
                 threading.Thread(target=lambda: handoff.put(child.stdout.readline(65537)), daemon=True).start()
                 line = handoff.get(timeout=180)
