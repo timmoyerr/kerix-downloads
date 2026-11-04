@@ -301,6 +301,43 @@ class RuntimeBootstrapTests(unittest.TestCase):
         self.assertTrue(all(self.key.encode() not in entry.read_bytes() for entry in state.rglob('*') if entry.is_file()))
         self.assertIn('preserved state and shut down twice', output.getvalue())
 
+    def test_upgrade_reuses_bootstrap_and_rejects_changed_owner_or_private_credentials(self):
+        state = self.root / 'workspace'; state.mkdir()
+        secret_file = state / 'secrets.json'
+        secret_file.write_text(json.dumps({'database_password': 'fixture-db', 'signing_key': 'fixture-signing'}))
+        expected = ('fixture-owner', acceptance.hashlib.sha256(secret_file.read_bytes()).hexdigest())
+        owner = base64.urlsafe_b64encode(b'{"sub":"fixture-owner"}').decode().rstrip('=')
+        handoff = json.dumps({'apiBaseUrl': 'http://127.0.0.1:45001/api/v1',
+            'session': {'accessToken': 'header.' + owner + '.signature', 'refreshToken': 'fixture-refresh'}}).encode() + b'\n'
+        child = MagicMock(); child.returncode = 0; child.stdout.readline.return_value = handoff
+        bootstrap = (json.dumps({'version': 1, 'githubTokenEncryptionKey': self.key}) + '\n').encode()
+
+        def open_api(request, **kwargs):
+            if isinstance(request, str):
+                response = MagicMock(); response.status = 200
+                response.__enter__.return_value = response
+                return response
+            raise acceptance.HTTPError(request.full_url, 402, 'License required', {},
+                io.BytesIO(b'{"detail":{"code":"LICENSE_REQUIRED"}}'))
+
+        output = io.StringIO()
+        with (patch.object(acceptance, 'runtime_parent_bootstrap') as generate_key,
+              patch.object(acceptance, 'runtime_command', return_value=['fixture-runtime']),
+              patch.object(acceptance.subprocess, 'Popen', return_value=child),
+              patch.object(acceptance.subprocess, 'CREATE_NO_WINDOW', 0, create=True),
+              patch.object(acceptance.threading, 'Thread', side_effect=lambda *, target, daemon: SimpleNamespace(start=target)),
+              patch.object(acceptance.OPENER, 'open', side_effect=open_api),
+              patch.object(acceptance, 'cleanup_runtime', return_value=[]), redirect_stdout(output)):
+            self.assertEqual(acceptance.check_runtime(self.runtime, state, expected_identity=expected,
+                parent_bootstrap=bootstrap), expected)
+            for previous, message in [(('another-owner', expected[1]), 'Workspace owner changed'),
+                                      ((expected[0], 'previous-secret-hash'), 'Private credentials changed')]:
+                with self.subTest(message=message), self.assertRaisesRegex(acceptance.AcceptanceFailure, message):
+                    acceptance.check_runtime(self.runtime, state, expected_identity=previous, parent_bootstrap=bootstrap)
+        generate_key.assert_not_called()
+        self.assertTrue(all(call.args == (bootstrap,) for call in child.stdin.write.call_args_list))
+        self.assertNotIn(self.key, output.getvalue())
+
     def test_legacy_runtime_gets_no_bootstrap_shutdown_line_and_low_diversity_is_retried(self):
         self.source.write_text('def main():\n    pass\n')
         with patch.object(acceptance.secrets, 'token_urlsafe') as random_key:
@@ -338,6 +375,110 @@ class RuntimeBootstrapTests(unittest.TestCase):
         diagnostic = acceptance.runtime_diagnostics(state)
         self.assertNotIn(self.key, diagnostic)
         self.assertIn('[sensitive line omitted]', diagnostic)
+
+
+class UpgradeAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='kerix-upgrade-test-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.install = self.root / 'installed'
+        self.previous = self.root / 'previous.exe'
+        self.current = self.root / 'current.exe'
+        self.identity = ('fixture-owner', 'fixture-private-secret-digest')
+        self.bootstrap = b'{"version":1,"githubTokenEncryptionKey":"fixture-only"}\n'
+
+    def test_upgrade_installs_over_same_directory_and_reopens_same_workspace(self):
+        order = []
+        def install(installer, destination):
+            self.assertEqual(destination, self.install)
+            order.append('install-old' if installer == self.previous else 'install-new')
+        def runtime(_runtime, state, **kwargs):
+            self.assertEqual(state, self.root / 'workspace')
+            self.assertEqual(kwargs['parent_bootstrap'], self.bootstrap)
+            order.append('backend-old' if 'expected_identity' not in kwargs else 'backend-new')
+            if 'expected_identity' in kwargs:
+                self.assertEqual(kwargs['expected_identity'], self.identity)
+            return self.identity
+        output = io.StringIO()
+        with (patch.object(acceptance, 'install_app', side_effect=install),
+              patch.object(acceptance, 'runtime_parent_bootstrap', return_value=self.bootstrap),
+              patch.object(acceptance, 'check_runtime', side_effect=runtime),
+              patch.object(acceptance, 'check_app', side_effect=lambda *args: order.append('app')),
+              patch.object(acceptance, 'check_postgres_tools', side_effect=lambda *args: order.append('probes')),
+              patch.object(acceptance, 'uninstall_app', side_effect=lambda *args: order.append('uninstall')),
+              redirect_stdout(output)):
+            acceptance.check_upgrade(self.current, self.previous, self.install, self.root)
+        self.assertEqual(order, ['install-old', 'backend-old', 'install-new', 'app', 'probes', 'backend-new', 'uninstall'])
+        self.assertIn('Manual NSIS upgrade preserved', output.getvalue())
+        self.assertNotIn('fixture-only', output.getvalue())
+        self.assertNotIn(self.identity[0], output.getvalue())
+
+    def test_upgrade_identity_failure_still_uninstalls_without_claiming_success(self):
+        output = io.StringIO()
+        with (patch.object(acceptance, 'install_app'),
+              patch.object(acceptance, 'runtime_parent_bootstrap', return_value=self.bootstrap),
+              patch.object(acceptance, 'check_runtime', side_effect=[self.identity,
+                  acceptance.AcceptanceFailure('Workspace owner changed on restart.')]),
+              patch.object(acceptance, 'check_app'), patch.object(acceptance, 'check_postgres_tools'),
+              patch.object(acceptance, 'uninstall_app') as uninstall, redirect_stdout(output)):
+            with self.assertRaisesRegex(acceptance.AcceptanceFailure, r'phase\(s\): upgraded-backend$'):
+                acceptance.check_upgrade(self.current, self.previous, self.install, self.root)
+        uninstall.assert_called_once_with(self.install)
+        self.assertNotIn('Manual NSIS upgrade preserved', output.getvalue())
+
+    def test_failed_previous_install_skips_dependent_checks_and_redacts_exception(self):
+        output = io.StringIO()
+        with (patch.object(acceptance, 'install_app', side_effect=OSError('fixture-private-installer-value')) as install,
+              patch.object(acceptance, 'check_runtime') as runtime,
+              patch.object(acceptance, 'check_app') as app,
+              patch.object(acceptance, 'uninstall_app') as uninstall, redirect_stdout(output)):
+            with self.assertRaisesRegex(acceptance.AcceptanceFailure, r'phase\(s\): previous-install$'):
+                acceptance.check_upgrade(self.current, self.previous, self.install, self.root)
+        install.assert_called_once_with(self.previous, self.install)
+        runtime.assert_not_called(); app.assert_not_called(); uninstall.assert_called_once()
+        self.assertNotIn('fixture-private-installer-value', output.getvalue())
+
+    def test_upgrade_app_failure_does_not_skip_runtime_or_cleanup(self):
+        output = io.StringIO()
+        with (patch.object(acceptance, 'install_app'),
+              patch.object(acceptance, 'runtime_parent_bootstrap', return_value=self.bootstrap),
+              patch.object(acceptance, 'check_runtime', return_value=self.identity) as runtime,
+              patch.object(acceptance, 'check_app', side_effect=ValueError('fixture-private-app-value')),
+              patch.object(acceptance, 'check_postgres_tools') as probes,
+              patch.object(acceptance, 'uninstall_app') as uninstall, redirect_stdout(output)):
+            with self.assertRaisesRegex(acceptance.AcceptanceFailure, r'phase\(s\): app$'):
+                acceptance.check_upgrade(self.current, self.previous, self.install, self.root)
+        self.assertEqual(runtime.call_count, 2)
+        probes.assert_called_once(); uninstall.assert_called_once()
+        self.assertNotIn('fixture-private-app-value', output.getvalue())
+
+    def test_upgrade_requires_pinned_older_release_and_complete_acceptance(self):
+        target, previous, digest = 'v1.0.3-preview.1', 'v1.0.2-preview.1', 'a' * 64
+        acceptance.validate_upgrade_source(target, '', '', skip_app='0', pg_only='0')
+        acceptance.validate_upgrade_source(target, previous, digest, skip_app='0', pg_only='0')
+        for source, sha, skip, probe in [(previous, '', '0', '0'), ('', digest, '0', '0'),
+                (previous, 'invalid', '0', '0'), (target, digest, '0', '0'),
+                ('v1.0.4-preview.1', digest, '0', '0'), ('../v1.0.2-preview.1', digest, '0', '0'),
+                (previous, digest, '1', '0'), (previous, digest, '0', '1')]:
+            with self.subTest(source=source, skip=skip, probe=probe), self.assertRaises(acceptance.AcceptanceFailure):
+                acceptance.validate_upgrade_source(target, source, sha, skip_app=skip, pg_only=probe)
+
+    def test_download_requires_release_checksum_and_exact_candidate_pin(self):
+        content = b'fixture-installer-not-executed'
+        digest = acceptance.hashlib.sha256(content).hexdigest()
+        name = 'kerix-desktop-1.0.2-setup.exe'
+        def fetch(url, destination, limit):
+            self.assertTrue(url.startswith('https://github.com/timmoyerr/kerix-downloads/releases/download/v1.0.2-preview.1/'))
+            destination.write_bytes((digest + '  ' + name + '\n').encode() if url.endswith('SHA256SUMS') else content)
+        for index, pin in enumerate((digest, 'b' * 64)):
+            directory = self.root / str(index); directory.mkdir()
+            with patch.object(acceptance, 'fetch', side_effect=fetch), redirect_stdout(io.StringIO()):
+                if pin == digest:
+                    self.assertEqual(acceptance.download_preview_installer('v1.0.2-preview.1', directory, pin), directory / name)
+                else:
+                    with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'explicitly selected candidate'):
+                        acceptance.download_preview_installer('v1.0.2-preview.1', directory, pin)
 
 
 if __name__ == '__main__':

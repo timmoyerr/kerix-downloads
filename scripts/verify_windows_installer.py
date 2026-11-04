@@ -185,11 +185,10 @@ def runtime_parent_bootstrap(runtime):
     return (json.dumps({'version': 1, 'githubTokenEncryptionKey': key}) + '\n').encode('ascii')
 
 
-def check_runtime(runtime, state):
-    """Launch twice from an empty private workspace and verify backend locking."""
-    owner = None
-    first_secrets = None
-    bootstrap = runtime_parent_bootstrap(runtime)
+def check_runtime(runtime, state, *, expected_identity=None, parent_bootstrap=None):
+    """Launch twice, verifying licensing and persisted identity across restarts/upgrades."""
+    owner, first_secrets = expected_identity if expected_identity is not None else (None, None)
+    bootstrap = parent_bootstrap if parent_bootstrap is not None else runtime_parent_bootstrap(runtime)
     for _ in range(2):
         environment = {name: value for name, value in os.environ.items() if name in
                        {'HOME', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP',
@@ -249,6 +248,7 @@ def check_runtime(runtime, state):
         require(child.returncode == 0, 'Backend did not shut down cleanly.')
         require(not (state / 'postgres/postmaster.pid').exists(), 'Backend left its PostgreSQL process running.')
     print('Bundled Python/PostgreSQL initialized, migrated, stayed locked, preserved state and shut down twice.')
+    return owner, first_secrets
 
 
 def exit_status(value):
@@ -541,6 +541,89 @@ def check_installed(install, root, *, skip_app=False):
     require(not failures, 'Installer acceptance failed in phase(s): ' + ', '.join(failures))
 
 
+def install_app(installer, install):
+    completed = subprocess.run([str(installer), '/S', '/D=' + str(install)], timeout=180)
+    require(completed.returncode == 0, 'Silent NSIS installation failed.')
+    require((install / 'Kerix.exe').is_file(), 'NSIS did not install Kerix.')
+
+
+def download_preview_installer(tag, directory, expected_sha=''):
+    match = re.fullmatch(r'v(\d+\.\d+\.\d+)-preview\.[1-9]\d*', tag)
+    require(match is not None, 'Use a valid published preview tag.')
+    require(not expected_sha or re.fullmatch(r'[a-f0-9]{64}', expected_sha), 'The optional expected installer checksum is invalid.')
+    name = 'kerix-desktop-' + match.group(1) + '-setup.exe'
+    base = 'https://github.com/timmoyerr/kerix-downloads/releases/download/' + tag + '/'
+    checksum_path, installer = directory / 'SHA256SUMS', directory / name
+    fetch(base + 'SHA256SUMS', checksum_path, 1024 * 1024)
+    checksums = {}
+    for line in checksum_path.read_text().splitlines():
+        match_line = re.fullmatch(r'([a-f0-9]{64})  ([A-Za-z0-9_.-]+)', line)
+        require(match_line is not None, 'Malformed release checksum file.')
+        require(match_line.group(2) not in checksums, 'Duplicate checksum entry.')
+        checksums[match_line.group(2)] = match_line.group(1)
+    require(name in checksums, 'The installer checksum is missing.')
+    fetch(base + name, installer, 1024 ** 3)
+    with installer.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    require(digest == checksums[name], 'The downloaded installer checksum differs.')
+    require(not expected_sha or digest == expected_sha, 'The installer differs from the explicitly selected candidate.')
+    print('Verified installer SHA256:', digest, flush=True)
+    return installer
+
+
+def validate_upgrade_source(target_tag, previous_tag, previous_sha, *, skip_app, pg_only):
+    require(bool(previous_tag) == bool(previous_sha), 'Upgrade acceptance requires both the previous tag and its exact installer SHA256.')
+    if not previous_tag:
+        return
+    target = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)-preview\.[1-9]\d*', target_tag)
+    previous = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)-preview\.[1-9]\d*', previous_tag)
+    require(target is not None and previous is not None, 'Upgrade acceptance requires valid published preview tags.')
+    require(re.fullmatch(r'[a-f0-9]{64}', previous_sha), 'Upgrade acceptance requires the exact previous installer SHA256.')
+    require(tuple(map(int, previous.groups())) < tuple(map(int, target.groups())), 'Upgrade acceptance requires a strictly older application version.')
+    require(skip_app == '0' and pg_only == '0', 'Upgrade acceptance cannot skip application or installer checks.')
+
+
+def check_upgrade(installer, previous_installer, install, root):
+    """Upgrade one owned installation and reopen the exact prior private workspace."""
+    failures = []
+    state = root / 'workspace'
+    state.mkdir()
+
+    def attempt(phase, operation):
+        try:
+            return True, operation()
+        except Exception as error:
+            failures.append(phase)
+            diagnostic = str(error) if isinstance(error, AcceptanceFailure) else type(error).__name__
+            print(phase + ' upgrade acceptance failed: ' + diagnostic, flush=True)
+            if phase.endswith('backend'):
+                print(runtime_diagnostics(state), flush=True)
+            return False, None
+
+    runtime = install / 'resources/personal-runtime'
+    try:
+        ok, _ = attempt('previous-install', lambda: install_app(previous_installer, install))
+        if ok:
+            # Reuse only this fixture's generated key, exactly as the native OS
+            # vault does during an ordinary application upgrade. Never print it.
+            def previous_backend():
+                bootstrap = runtime_parent_bootstrap(runtime)
+                return check_runtime(runtime, state, parent_bootstrap=bootstrap), bootstrap
+            ok, prior = attempt('previous-backend', previous_backend)
+        if ok:
+            ok, _ = attempt('upgrade-install', lambda: install_app(installer, install))
+        if ok:
+            identity, bootstrap = prior
+            attempt('app', lambda: check_app(install / 'Kerix.exe', root / 'app-profile'))
+            attempt('postgres-probes', lambda: check_postgres_tools(runtime, root / 'postgres-probes'))
+            attempt('upgraded-backend', lambda: check_runtime(runtime, state,
+                    expected_identity=identity, parent_bootstrap=bootstrap))
+    finally:
+        attempt('uninstall', lambda: uninstall_app(install))
+    require(not failures, 'Upgrade acceptance failed in phase(s): ' + ', '.join(failures))
+    print('Manual NSIS upgrade preserved the workspace owner and private credentials; app, runtime and uninstall passed.')
+
+
 def main():
     tag = os.environ.get('KERIX_RELEASE_TAG', '')
     match = re.fullmatch(r'v(\d+\.\d+\.\d+)-preview\.[1-9]\d*', tag)
@@ -549,37 +632,28 @@ def main():
     require(skip_app in {'0', '1'}, 'Use KERIX_SKIP_APP_SMOKE=0 or 1 explicitly.')
     expected_sha = os.environ.get('KERIX_EXPECTED_INSTALLER_SHA256', '')
     require(not expected_sha or re.fullmatch(r'[a-f0-9]{64}', expected_sha), 'The optional expected installer checksum is invalid.')
-    version = match.group(1)
-    name = 'kerix-desktop-' + version + '-setup.exe'
     base = 'https://github.com/timmoyerr/kerix-downloads/releases/download/' + tag + '/'
     pg_only = os.environ.get('KERIX_PG_PROBE_ONLY', '0')
     require(pg_only in {'0', '1'}, 'Use KERIX_PG_PROBE_ONLY=0 or 1 explicitly.')
+    previous_tag = os.environ.get('KERIX_UPGRADE_FROM_TAG', '')
+    previous_sha = os.environ.get('KERIX_UPGRADE_FROM_SHA256', '')
+    validate_upgrade_source(tag, previous_tag, previous_sha, skip_app=skip_app, pg_only=pg_only)
     if pg_only == '1':
         probe_only(base, os.environ.get('KERIX_PG_PROBE_SHA256', ''))
         return
     with private_fixture_directory('kerix-installer-acceptance-') as root:
-        checksum_path, installer = root / 'SHA256SUMS', root / name
-        fetch(base + 'SHA256SUMS', checksum_path, 1024 * 1024)
-        checksums = {}
-        for line in checksum_path.read_text().splitlines():
-            match_line = re.fullmatch(r'([a-f0-9]{64})  ([A-Za-z0-9_.-]+)', line)
-            require(match_line is not None, 'Malformed release checksum file.')
-            require(match_line.group(2) not in checksums, 'Duplicate checksum entry.')
-            checksums[match_line.group(2)] = match_line.group(1)
-        require(name in checksums, 'The installer checksum is missing.')
-        fetch(base + name, installer, 1024 ** 3)
-        with installer.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        require(digest == checksums[name], 'The downloaded installer checksum differs.')
-        require(not expected_sha or digest == expected_sha, 'The installer differs from the explicitly selected candidate.')
-        print('Verified installer SHA256:', digest, flush=True)
+        installer = download_preview_installer(tag, root, expected_sha)
         install = root / 'installed'
-        completed = subprocess.run([str(installer), '/S', '/D=' + str(install)], timeout=180)
-        require(completed.returncode == 0, 'Silent NSIS installation failed.')
-        executable = install / 'Kerix.exe'
-        require(executable.is_file(), 'NSIS did not install Kerix.')
+        install_app(installer, install)
         check_installed(install, root, skip_app=skip_app == '1')
         print('Downloaded checksum, NSIS install and uninstall passed on Windows Server 2022.')
+        if previous_tag:
+            previous_download = root / 'previous-download'
+            previous_download.mkdir()
+            previous_installer = download_preview_installer(previous_tag, previous_download, previous_sha)
+            upgrade_root = root / 'upgrade'
+            upgrade_root.mkdir()
+            check_upgrade(installer, previous_installer, upgrade_root / 'installed', upgrade_root)
 
 
 if __name__ == '__main__':
