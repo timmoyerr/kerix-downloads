@@ -144,19 +144,33 @@ def fetch(url, destination, limit):
 
 
 def check_app(executable, profile):
-    result = subprocess.run([str(executable), '--kerix-smoke-test', '--user-data-dir=' + str(profile)],
-                            env=dict(os.environ, KERIX_NATIVE_SMOKE='1'), capture_output=True, timeout=150)
+    timed_out = False
+    try:
+        result = subprocess.run([str(executable), '--kerix-smoke-test', '--user-data-dir=' + str(profile)],
+                                env=dict(os.environ, KERIX_NATIVE_SMOKE='1'), capture_output=True, timeout=150)
+        stdout, stderr, returncode = result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired as error:
+        # subprocess.run kills its owned child and retains partial captured
+        # output. Preserve useful Electron startup diagnostics without printing
+        # the exception value, command arguments or unbounded raw output.
+        timed_out = True
+        stdout, stderr, returncode = error.stdout, error.stderr, None
     # Handoff credentials are never included in this application smoke output.
-    lines = (result.stdout + result.stderr).decode('utf-8', errors='replace').splitlines()
+    def bounded_text(value):
+        return (value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value or '')[-16384:]
+    lines = (bounded_text(stdout) + '\n' + bounded_text(stderr)).splitlines()
     marker = next((line.removeprefix('KERIX_SMOKE_RESULT=') for line in lines
                    if line.startswith('KERIX_SMOKE_RESULT=')), 'null')
-    report = json.loads(marker)
-    ok = result.returncode == 0 and isinstance(report, dict) and report.get('ok') is True and report.get('licenseLocked') is True
+    try:
+        report = json.loads(marker)
+    except (ValueError, TypeError):
+        report = None
+    ok = not timed_out and returncode == 0 and isinstance(report, dict) and report.get('ok') is True and report.get('licenseLocked') is True
     if not ok:
-        print('App exit status:', result.returncode, flush=True)
+        print('App exit status:', 'timeout after 150 seconds' if timed_out else returncode, flush=True)
         print('Smoke marker present:', marker != 'null', flush=True)
         for line in lines[-30:]:
-            if re.search(r'password|authorization|signing_key|secret_key|(?:access|refresh)[_-]?token', line, re.I):
+            if re.search(r'password|authorization|signing_key|secret_key|github[_ -]?token[_ -]?encryption[_ -]?key|(?:access|refresh|activation)[_-]?token|license[_ -]?key|\bBearer\b|\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', line, re.I):
                 print('[sensitive app diagnostic omitted]', flush=True)
             else:
                 print(line[:600], flush=True)

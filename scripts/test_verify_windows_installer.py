@@ -240,6 +240,43 @@ class InstallerPhaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'current-user SID is unavailable'):
                     acceptance.current_user_identity({})
 
+    def test_app_timeout_keeps_bounded_startup_diagnostics_and_redacts_credentials(self):
+        error = subprocess.TimeoutExpired(['fixture-owned-Kerix.exe'], 150,
+            output=b'Electron startup: Cannot find module conf\n',
+            stderr=b'x' * 20000 + b'\ngithubTokenEncryptionKey=fixture-private-bootstrap\nlicense_key=fixture-private-license\n'
+                   b'eyJzdWIiOiJmaXh0dXJlIn0.cGF5bG9hZA.c2lnbmF0dXJl\n')
+        output = io.StringIO()
+        with patch.object(acceptance.subprocess, 'run', side_effect=error) as run, redirect_stdout(output):
+            with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'activation/preload smoke failed'):
+                acceptance.check_app(self.install / 'Kerix.exe', self.root / 'app-profile')
+        self.assertEqual(run.call_args.kwargs['timeout'], 150)
+        self.assertIn('timeout after 150 seconds', output.getvalue())
+        self.assertIn('Cannot find module conf', output.getvalue())
+        self.assertNotIn('fixture-private-bootstrap', output.getvalue())
+        self.assertNotIn('fixture-private-license', output.getvalue())
+        self.assertNotIn('eyJzdWIiOiJmaXh0dXJlIn0', output.getvalue())
+        self.assertIn('[sensitive app diagnostic omitted]', output.getvalue())
+        self.assertLess(len(output.getvalue()), 2000)
+
+    def test_app_timeout_cannot_pass_with_an_earlier_success_marker(self):
+        error = subprocess.TimeoutExpired(['fixture-owned-Kerix.exe'], 150,
+            output=b'KERIX_SMOKE_RESULT={"ok":true,"licenseLocked":true}\n')
+        with patch.object(acceptance.subprocess, 'run', side_effect=error), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'activation/preload smoke failed'):
+                acceptance.check_app(self.install / 'Kerix.exe', self.root / 'app-profile')
+
+    def test_app_smoke_requires_successful_exit_and_a_valid_locked_marker(self):
+        for code, marker, passed in [(0, '{"ok":true,"licenseLocked":true}', True),
+                (1, '{"ok":true,"licenseLocked":true}', False),
+                (0, '{"ok":true,"licenseLocked":false}', False), (0, 'invalid-json', False)]:
+            result = subprocess.CompletedProcess([], code, ('KERIX_SMOKE_RESULT=' + marker + '\n').encode(), b'')
+            with self.subTest(code=code, marker=marker), patch.object(acceptance.subprocess, 'run', return_value=result), redirect_stdout(io.StringIO()):
+                if passed:
+                    acceptance.check_app(self.install / 'Kerix.exe', self.root / 'app-profile')
+                else:
+                    with self.assertRaisesRegex(acceptance.AcceptanceFailure, 'activation/preload smoke failed'):
+                        acceptance.check_app(self.install / 'Kerix.exe', self.root / 'app-profile')
+
 
 class RuntimeBootstrapTests(unittest.TestCase):
     def setUp(self):
